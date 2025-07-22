@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Aura Orb Admin Panel</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link href="/output.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <script type="module">
+    import { initializeFirebase } from './firebase.js';
+
+    let db;
+    let gameWindow = null;
+    const API_URL = "https://graphql.tradeport.xyz/";
+    const HEADERS = {
+      "x-api-user": "auraonsui",
+      "x-api-key": "dwHwieW.36f7a5bb7b7e7fd606a247414ccf158c",
+      "Content-Type": "application/json"
+    };
+    const COLLECTION_ID = "ac33ae15-5c16-4d3b-b92a-2dde11e1346b";
+
+    initializeFirebase().then(firebaseDb => {
+      db = firebaseDb;
+      console.log("Firebase initialized for admin panel");
+      if (!db) {
+        Swal.fire({
+          title: 'Error',
+          text: 'Failed to initialize Firebase. Please check your connection.',
+          icon: 'error',
+          background: '#1a1a1a',
+          color: '#ffffff',
+          confirmButtonColor: '#4a5568'
+        });
+      } else {
+        fetchWinners();
+        initializeGameControl();
+        fetchNFTsForPlayers();
+      }
+    }).catch(error => {
+      console.error("Anonymous auth error:", error);
+      Swal.fire({
+        title: 'Error',
+        text: 'Failed to authenticate with Firebase. Please check your connection.',
+        icon: 'error',
+        background: '#1a1a1a',
+        color: '#ffffff',
+        confirmButtonColor: '#4a5568'
+      });
+    });
+
+    async function initializeGameControl() {
+      try {
+        const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/12.0.0/firebase-firestore.js');
+        await setDoc(doc(db, 'game_control', 'start'), { start: false });
+        console.log("Initialized game_control/start with start: false");
+      } catch (error) {
+        console.error("Error initializing game_control/start:", error);
+        Swal.fire({
+          title: 'Error',
+          text: `Failed to initialize game control: ${error.message}. Please refresh and try again.`,
+          icon: 'error',
+          background: '#1a1a1a',
+          color: '#ffffff',
+          confirmButtonColor: '#4a5568'
+        });
+      }
+    }
+
+    async function fetchNFTsForPlayers() {
+      let nfts = [];
+      let offset = 0;
+      const limit = 50; // Match provided JSON's limit
+      let totalCount = await fetchTotalNFTCount(); // Get total unlisted NFTs
+      if (totalCount === null) {
+        console.error("Failed to fetch total NFT count. Assuming 50 as fallback.");
+        totalCount = 50;
+      }
+      console.log(`Total unlisted NFTs available: ${totalCount}`);
+
+      while (nfts.length < totalCount) {
+        const query = `
+          query fetchCollectionItems($where: nfts_bool_exp!, $order_by: [nfts_order_by!], $offset: Int, $limit: Int!) {
+            sui {
+              nfts(where: $where, order_by: $order_by, offset: $offset, limit: $limit) {
+                id
+                token_id
+                token_id_index
+                name
+                media_url
+                media_type
+                ranking
+                owner
+                delegated_owner
+                chain_state
+                lastSale: actions(
+                  where: {type: {_in: ["buy", "accept-collection-bid", "accept-bid"]}}
+                  order_by: {block_time: desc}
+                  limit: 1
+                ) {
+                  price
+                  price_coin
+                }
+                contract {
+                  commission: default_commission { 
+                    key
+                    market_fee
+                    market_name
+                    royalty
+                    is_custodial
+                  }
+                }
+                attributes {
+                  type
+                  value
+                }
+              }
+            }
+          }
+        `;
+        const variables = {
+          where: { 
+            collection_id: { _eq: COLLECTION_ID }
+          },
+          order_by: [{ token_id: "asc" }, { ranking: "asc" }],
+          offset,
+          limit
+        };
+
+        try {
+          const response = await fetch(API_URL, {
+            method: 'POST',
+            headers: HEADERS,
+            body: JSON.stringify({ query, variables })
+          });
+          console.log(`API Response Status (offset ${offset}):`, response.status);
+          const result = await response.json();
+          console.log(`API Response (offset ${offset}):`, JSON.stringify(result, null, 2));
+          if (result.errors) {
+            console.error(`GraphQL Errors: ${result.errors.map(e => e.message).join(', ')}`);
+            Swal.fire({
+              title: 'Error',
+              text: `GraphQL Errors: ${result.errors.map(e => e.message).join(', ')}`,
+              icon: 'error',
+              background: '#1a1a1a',
+              color: '#ffffff',
+              confirmButtonColor: '#4a5568'
+            });
+            break;
+          }
+          const fetchedNFTs = result.data.sui.nfts || [];
+          console.log(`Fetched ${fetchedNFTs.length} NFTs in batch (offset: ${offset}, total: ${nfts.length + fetchedNFTs.length}/${totalCount})`);
+          nfts.push(...fetchedNFTs);
+          if (fetchedNFTs.length === 0) {
+            console.log("No more NFTs to fetch.");
+            break;
+          }
+          offset += fetchedNFTs.length; // Increment by actual number fetched
+          if (nfts.length >= totalCount) {
+            console.log(`Reached total count of ${totalCount} NFTs.`);
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Delay to avoid rate limiting
+        } catch (e) {
+          console.error(`Fetch NFTs Error (offset ${offset}): ${e.message}`);
+          Swal.fire({
+            title: 'Error',
+            text: `Failed to fetch NFTs: ${e.message}. Retrying after delay...`,
+            icon: 'error',
+            background: '#1a1a1a',
+            color: '#ffffff',
+            confirmButtonColor: '#4a5568'
+          });
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Longer delay on error
+          continue; // Retry the same offset
+        }
+      }
+
+      console.log(`Total Fetched ${nfts.length} NFTs for players table`);
+      if (nfts.length < totalCount) {
+        Swal.fire({
+          title: 'Warning',
+          text: `Fetched only ${nfts.length} of ${totalCount} expected NFTs. Possible API limitation or data issue.`,
+          icon: 'warning',
+          background: '#1a1a1a',
+          color: '#ffffff',
+          confirmButtonColor: '#4a5568'
+        });
+      }
+
+      updatePlayersTable(nfts.map(nft => ({
+        id: nft.id,
+        name: nft.name,
+        owner: nft.owner,
+        role: determineRole(nft.attributes ? Object.fromEntries(nft.attributes.map(attr => [attr.type, attr.value])) : {})
+      })));
+    }
+
+    async function fetchTotalNFTCount() {
+      const countQuery = `
+        query fetchCollectionCount($where: nfts_bool_exp!) {
+          sui {
+            nfts_aggregate(where: $where) {
+              aggregate {
+                count
+              }
+            }
+          }
+        }
+      `;
+      const countVariables = {
+        where: { 
+          collection_id: { _eq: COLLECTION_ID },
+          _not: { listed: { _eq: true } }
+        }
+      };
+      try {
+        const countResponse = await fetch(API_URL, {
+          method: 'POST',
+          headers: HEADERS,
+          body: JSON.stringify({ query: countQuery, variables: countVariables })
+        });
+        const countResult = await countResponse.json();
+        if (countResult.errors) {
+          console.error(`GraphQL Count Errors: ${countResult.errors.map(e => e.message).join(', ')}`);
+          return null;
+        }
+        const totalCount = countResult.data.sui.nfts_aggregate.aggregate.count;
+        console.log('Total Unlisted NFTs in collection:', totalCount);
+        return totalCount;
+      } catch (e) {
+        console.error(`Fetch Total NFT Count Error: ${e.message}`);
+        Swal.fire({
+          title: 'Error',
+          text: `Failed to fetch total NFT count: ${e.message}.`,
+          icon: 'error',
+          background: '#1a1a1a',
+          color: '#ffffff',
+          confirmButtonColor: '#4a5568'
+        });
+        return null;
+      }
+    }
+
+    function determineRole(properties) {
+      const defaultProperties = {
+        "Aura Effect": "Surge",
+        "Skin": "No Skin",
+        "Rarity": "Common"
+      };
+      const effectiveProperties = { ...defaultProperties, ...properties };
+      console.log('Effective Properties for Role:', effectiveProperties);
+      const auraEffect = traits["Aura Effect"].find(t => t.value === effectiveProperties["Aura Effect"]) || { evasion: 0, crowd_control: 0 };
+      const skin = traits["Skin"].find(t => t.value === effectiveProperties.Skin) || { defense: 0 };
+      const rarity = traits["Rarity"].find(t => t.value === effectiveProperties.Rarity) || { multiplier: 1.0 };
+      const isLongRange = ["Overcharge", "Absorb", "Pulse"].includes(auraEffect.value);
+      return auraEffect.evasion >= 20 ? "Dodging" :
+        isLongRange ? "Long-Range" :
+          skin.defense >= 3 ? "Tank" :
+            rarity.multiplier >= 1.3 ? "Good" : "Bad";
+    }
+
+    const traits = {
+      "Aura Effect": [
+        { value: "Surge", evasion: 0, crowd_control: 0 },
+        { value: "Scape", evasion: 25, crowd_control: 0 },
+        { value: "Buff", evasion: 0, crowd_control: 0 },
+        { value: "Split", evasion: 0, crowd_control: 0 },
+        { value: "Absorb", evasion: 0, crowd_control: 0 },
+        { value: "Shield", evasion: 0, crowd_control: 0 },
+        { value: "Pulse", evasion: 0, crowd_control: 15 },
+        { value: "Stealth", evasion: 20, crowd_control: 0 },
+        { value: "Overcharge", evasion: 0, crowd_control: 0 },
+        { value: "Singularity", evasion: 0, crowd_control: 20 }
+      ],
+      "Skin": [
+        { value: "No Skin", defense: 0 },
+        { value: "Metallic", defense: 2 },
+        { value: "Crystal", defense: 3 },
+        { value: "Nebula", defense: 4 },
+        { value: "Holographic", defense: 5 }
+      ],
+      "Rarity": [
+        { value: "Common", multiplier: 1.0 },
+        { value: "Uncommon", multiplier: 1.1 },
+        { value: "Rare", multiplier: 1.2 },
+        { value: "Epic", multiplier: 1.3 },
+        { value: "Legendary", multiplier: 1.5 }
+      ]
+    };
+
+    async function fetchWinners() {
+      if (!db) {
+        console.error("Firestore not initialized for winners fetch");
+        return;
+      }
+      try {
+        const { collection, onSnapshot } = await import('https://www.gstatic.com/firebasejs/12.0.0/firebase-firestore.js');
+        onSnapshot(collection(db, 'winners'), (snapshot) => {
+          const winners = [];
+          snapshot.forEach(doc => {
+            const data = doc.data();
+            winners.push({
+              id: data.id,
+              name: data.name,
+              owner: data.owner,
+              role: data.role,
+              timestamp: data.timestamp ? new Date(data.timestamp.toDate()).toLocaleString() : 'N/A',
+              stats: data.stats
+            });
+          });
+          const winnersTable = document.getElementById('winners-table').querySelector('tbody');
+          winnersTable.innerHTML = winners.length > 0 ? winners.map(winner => `
+            <tr>
+              <td class="border px-4 py-2">${winner.id}</td>
+              <td class="border px-4 py-2">${winner.name}</td>
+              <td class="border px-4 py-2">${winner.owner}</td>
+              <td class="border px-4 py-2">${winner.role}</td>
+              <td class="border px-4 py-2">${winner.timestamp}</td>
+              <td class="border px-4 py-2">${winner.stats.health.toFixed(1)}</td>
+              <td class="border px-4 py-2">${winner.stats.attack.toFixed(1)}</td>
+              <td class="border px-4 py-2">${winner.stats.defense.toFixed(1)}</td>
+              <td class="border px-4 py-2">${winner.stats.speed.toFixed(1)}</td>
+              <td class="border px-4 py-2">${winner.stats.rarity}</td>
+            </tr>
+          `).join('') : `<tr><td colspan="10" class="text-center">No winners yet</td></tr>`;
+        }, (error) => {
+          console.error('Error fetching winners:', error);
+          Swal.fire({
+            title: 'Error',
+            text: 'Failed to fetch winners. Please check your connection.',
+            icon: 'error',
+            background: '#1a1a1a',
+            color: '#ffffff',
+            confirmButtonColor: '#4a5568'
+          });
+        });
+      } catch (e) {
+        console.error('Error loading Firestore for winners:', e);
+        Swal.fire({
+          title: 'Error',
+          text: `Failed to load Firestore for winners: ${e.message}.`,
+          icon: 'error',
+          background: '#1a1a1a',
+          color: '#ffffff',
+          confirmButtonColor: '#4a5568'
+        });
+      }
+    }
+
+    function updatePlayersTable(players) {
+      const playersTable = document.getElementById('players-table').querySelector('tbody');
+      playersTable.innerHTML = players.length > 0
+        ? players.map((player, index) => `
+      <tr>
+        <td class="border px-4 py-2">${index + 1}</td>
+        <td class="border px-4 py-2">${player.id}</td>
+        <td class="border px-4 py-2">${player.name}</td>
+        <td class="border px-4 py-2">${player.owner}</td>
+        <td class="border px-4 py-2">${player.role}</td>
+      </tr>
+    `).join('')
+        : `<tr><td colspan="5" class="text-center">No players loaded</td></tr>`;
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('start-game').addEventListener('click', async () => {
+        if (!db) {
+          console.error("Firestore not initialized");
+          Swal.fire({
+            title: 'Error',
+            text: 'Firestore not initialized. Please refresh and try again.',
+            icon: 'error',
+            background: '#1a1a1a',
+            color: '#ffffff',
+            confirmButtonColor: '#4a5568'
+          });
+          return;
+        }
+        if (!gameWindow || gameWindow.closed) {
+          gameWindow = window.open('index.html', 'gameWindow');
+          if (!gameWindow) {
+            Swal.fire({
+              title: 'Error',
+              text: 'Game window could not be opened. Please allow pop-ups and try again.',
+              icon: 'error',
+              background: '#1a1a1a',
+              color: '#ffffff',
+              confirmButtonColor: '#4a5568'
+            });
+            return;
+          }
+          document.getElementById('start-game').textContent = "Starting game...";
+          document.getElementById('start-game').disabled = true;
+        }
+        try {
+          const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/12.0.0/firebase-firestore.js');
+          await setDoc(doc(db, 'game_control', 'start'), { start: true });
+          console.log('Game start signal sent to Firestore');
+          Swal.fire({
+            title: 'Game Starting',
+            text: 'Game start signal sent. Waiting for game to initialize...',
+            icon: 'info',
+            background: '#1a1a1a',
+            color: '#ffffff',
+            confirmButtonColor: '#4a5568',
+            timer: 3000,
+            timerProgressBar: true
+          }).then(() => {
+            setDoc(doc(db, 'game_control', 'start'), { start: false })
+              .then(() => {
+                console.log("Reset game_control/start to false");
+                document.getElementById('start-game').textContent = "Start Game";
+                document.getElementById('start-game').disabled = false;
+              })
+              .catch((error) => {
+                console.error("Error resetting game_control/start:", error);
+                document.getElementById('start-game').textContent = "Start Game";
+                document.getElementById('start-game').disabled = false;
+                Swal.fire({
+                  title: 'Error',
+                  text: `Failed to reset game control: ${error.message}.`,
+                  icon: 'error',
+                  background: '#1a1a1a',
+                  color: '#ffffff',
+                  confirmButtonColor: '#4a5568'
+                });
+              });
+          });
+        } catch (e) {
+          console.error('Error triggering game start:', e);
+          Swal.fire({
+            title: 'Error',
+            text: `Failed to start game: ${e.message}. Please check your connection.`,
+            icon: 'error',
+            background: '#1a1a1a',
+            color: '#ffffff',
+            confirmButtonColor: '#4a5568'
+          });
+          document.getElementById('start-game').textContent = "Start Game";
+          document.getElementById('start-game').disabled = false;
+        }
+      });
+    });
+  </script>
+  <style>
+    body {
+      margin: 0;
+      background: linear-gradient(to bottom, #1a1a1a, #2d3748);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      font-family: 'Arial', sans-serif;
+    }
+
+    .container {
+      text-align: center;
+      color: white;
+      width: 90%;
+      max-width: 1200px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 2rem;
+    }
+
+    th,
+    td {
+      border: 1px solid #4a5568;
+      padding: 0.5rem;
+      text-align: left;
+    }
+
+    th {
+      background: #4a5568;
+    }
+
+    .bg-blue-600 {
+      background-color: #2563eb;
+    }
+
+    .hover\:bg-blue-700:hover {
+      background-color: #1d4ed8;
+    }
+
+    .text-white {
+      color: #ffffff;
+    }
+
+    .px-4 {
+      padding-left: 1rem;
+      padding-right: 1rem;
+    }
+
+    .py-2 {
+      padding-top: 0.5rem;
+      padding-bottom: 0.5rem;
+    }
+
+    .px-6 {
+      padding-left: 1.5rem;
+      padding-right: 1.5rem;
+    }
+
+    .py-3 {
+      padding-top: 0.75rem;
+      padding-bottom: 0.75rem;
+    }
+
+    .rounded-lg {
+      border-radius: 0.5rem;
+    }
+
+    .text-lg {
+      font-size: 1.125rem;
+    }
+
+    .mb-6 {
+      margin-bottom: 1.5rem;
+    }
+
+    .text-3xl {
+      font-size: 1.875rem;
+    }
+
+    .text-2xl {
+      font-size: 1.5rem;
+    }
+
+    .font-bold {
+      font-weight: 700;
+    }
+
+    .mb-4 {
+      margin-bottom: 1rem;
+    }
+
+    .mb-8 {
+      margin-bottom: 2rem;
+    }
+
+    .text-center {
+      text-align: center;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h1 class="text-3xl font-bold mb-6">Aura Orb Admin Panel</h1>
+    <button id="start-game" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg text-lg mb-6">Start
+      Game</button>
+    <h2 class="text-2xl font-bold mb-4">Current Players</h2>
+    <table id="players-table" class="mb-8">
+      <thead>
+        <tr>
+          <th class="px-4 py-2">ID</th>
+          <th class="px-4 py-2">Name</th>
+          <th class="px-4 py-2">Owner Address</th>
+          <th class="px-4 py-2">Role</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td colspan="4" class="text-center px-4 py-2">Loading players...</td>
+        </tr>
+      </tbody>
+    </table>
+    <h2 class="text-2xl font-bold mb-4">Winners History</h2>
+    <table id="winners-table">
+      <thead>
+        <tr>
+          <th class="px-4 py-2">ID</th>
+          <th class="px-4 py-2">Name</th>
+          <th class="px-4 py-2">Owner Address</th>
+          <th class="px-4 py-2">Role</th>
+          <th class="px-4 py-2">Timestamp</th>
+          <th class="px-4 py-2">Health</th>
+          <th class="px-4 py-2">Attack</th>
+          <th class="px-4 py-2">Defense</th>
+          <th class="px-4 py-2">Speed</th>
+          <th class="px-4 py-2">Rarity</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td colspan="10" class="text-center px-4 py-2">Loading winners...</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+
+</html>
